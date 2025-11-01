@@ -28,6 +28,7 @@ from vggt.utils.geometry import unproject_depth_map_to_point_map
 
 # Import visual utilities
 from visual_util import predictions_to_glb
+from metadata_util import get_pitch_angles
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -258,6 +259,8 @@ def gradio_demo(
     show_cam=True,
     mask_sky=False,
     prediction_mode="Depthmap and Camera Branch",
+    use_gravity_alignment=True,
+    show_axes=True,
 ):
     """
     Perform reconstruction using the already-created target_dir/images.
@@ -290,8 +293,32 @@ def gradio_demo(
     # Build a GLB file name
     glbfile = os.path.join(
         target_dir,
-        f"glbscene_{conf_thres}_{frame_filter.replace('.', '_').replace(':', '').replace(' ', '_')}_maskb{mask_black_bg}_maskw{mask_white_bg}_cam{show_cam}_sky{mask_sky}_pred{prediction_mode.replace(' ', '_')}.glb",
+        f"glbscene_{conf_thres}_{frame_filter.replace('.', '_').replace(':', '').replace(' ', '_')}_maskb{mask_black_bg}_maskw{mask_white_bg}_cam{show_cam}_sky{mask_sky}_pred{prediction_mode.replace(' ', '_')}_gravity{use_gravity_alignment}_axes{show_axes}.glb",
     )
+
+    # Load pitch angles from metadata if gravity alignment is enabled
+    pitch_angles = None
+    if use_gravity_alignment:
+        # Try to load pitch angles from metadata
+        image_names = glob.glob(os.path.join(target_dir, "images", "*"))
+        image_names = sorted(image_names)
+        
+        # Check for metadata.json file in target_dir
+        metadata_path = os.path.join(target_dir, "metadata.json")
+        if os.path.exists(metadata_path):
+            print(f"Loading pitch angles from {metadata_path}")
+            pitch_angles = get_pitch_angles(image_names, metadata_path)
+        else:
+            print("Attempting to extract pitch angles from image EXIF/filenames")
+            pitch_angles = get_pitch_angles(image_names)
+        
+        # Log how many pitch angles were found
+        valid_count = sum(1 for p in pitch_angles if p is not None)
+        if valid_count > 0:
+            print(f"Found {valid_count}/{len(pitch_angles)} pitch angles")
+        else:
+            print("No pitch angles found in metadata, will use camera orientation analysis")
+            pitch_angles = None
 
     # Convert predictions to GLB
     try:
@@ -305,6 +332,8 @@ def gradio_demo(
             mask_sky=mask_sky,
             target_dir=target_dir,
             prediction_mode=prediction_mode,
+            pitch_angles=pitch_angles,
+            show_axes=show_axes,
         )
         glbscene.export(file_obj=glbfile)
     except Exception as e:
@@ -341,7 +370,8 @@ def update_log():
 
 
 def update_visualization(
-    target_dir, conf_thres, frame_filter, mask_black_bg, mask_white_bg, show_cam, mask_sky, prediction_mode, is_example
+    target_dir, conf_thres, frame_filter, mask_black_bg, mask_white_bg, show_cam, mask_sky, prediction_mode, 
+    use_gravity_alignment, show_axes, is_example
 ):
     """
     Reload saved predictions from npz, create (or reuse) the GLB for new parameters,
@@ -376,10 +406,22 @@ def update_visualization(
 
     glbfile = os.path.join(
         target_dir,
-        f"glbscene_{conf_thres}_{frame_filter.replace('.', '_').replace(':', '').replace(' ', '_')}_maskb{mask_black_bg}_maskw{mask_white_bg}_cam{show_cam}_sky{mask_sky}_pred{prediction_mode.replace(' ', '_')}.glb",
+        f"glbscene_{conf_thres}_{frame_filter.replace('.', '_').replace(':', '').replace(' ', '_')}_maskb{mask_black_bg}_maskw{mask_white_bg}_cam{show_cam}_sky{mask_sky}_pred{prediction_mode.replace(' ', '_')}_gravity{use_gravity_alignment}_axes{show_axes}.glb",
     )
 
     if not os.path.exists(glbfile):
+        # Load pitch angles if gravity alignment is enabled
+        pitch_angles = None
+        if use_gravity_alignment:
+            image_names = glob.glob(os.path.join(target_dir, "images", "*"))
+            image_names = sorted(image_names)
+            
+            metadata_path = os.path.join(target_dir, "metadata.json")
+            if os.path.exists(metadata_path):
+                pitch_angles = get_pitch_angles(image_names, metadata_path)
+            else:
+                pitch_angles = get_pitch_angles(image_names)
+        
         try:
             glbscene = predictions_to_glb(
                 predictions,
@@ -391,6 +433,8 @@ def update_visualization(
                 mask_sky=mask_sky,
                 target_dir=target_dir,
                 prediction_mode=prediction_mode,
+                pitch_angles=pitch_angles,
+                show_axes=show_axes,
             )
             glbscene.export(file_obj=glbfile)
         except Exception as e:
@@ -551,6 +595,8 @@ with gr.Blocks(
                     mask_sky = gr.Checkbox(label="Filter Sky", value=False)
                     mask_black_bg = gr.Checkbox(label="Filter Black Background", value=False)
                     mask_white_bg = gr.Checkbox(label="Filter White Background", value=False)
+                    use_gravity_alignment = gr.Checkbox(label="Align with Gravity (from pitch metadata)", value=True)
+                    show_axes = gr.Checkbox(label="Show Coordinate Axes (X=Red, Y=Green, Z=Blue)", value=True)
 
     # ---------------------- Examples section (if examples are available) ----------------------
     if example_videos:
@@ -564,6 +610,8 @@ with gr.Blocks(
             show_cam,
             mask_sky,
             prediction_mode,
+            use_gravity_alignment,
+            show_axes,
             is_example_str,
         ):
             """
@@ -576,7 +624,8 @@ with gr.Blocks(
             # Always use "All" for frame_filter in examples
             frame_filter = "All"
             glbfile, log_msg, dropdown = gradio_demo(
-                target_dir, conf_thres, frame_filter, mask_black_bg, mask_white_bg, show_cam, mask_sky, prediction_mode
+                target_dir, conf_thres, frame_filter, mask_black_bg, mask_white_bg, show_cam, mask_sky, prediction_mode,
+                use_gravity_alignment, show_axes
             )
             return glbfile, log_msg, target_dir, dropdown, image_paths
 
@@ -584,7 +633,7 @@ with gr.Blocks(
         examples = []
         for i, video_path in enumerate(example_videos[:5]):  # Limit to 5 examples
             examples.append([
-                video_path, str(i+10), None, 50.0, False, False, True, False, "Depthmap and Camera Branch", "True"
+                video_path, str(i+10), None, 50.0, False, False, True, False, "Depthmap and Camera Branch", True, True, "True"
             ])
 
         gr.Markdown("Click any row to load an example.", elem_classes=["example-log"])
@@ -601,6 +650,8 @@ with gr.Blocks(
                 show_cam,
                 mask_sky,
                 prediction_mode,
+                use_gravity_alignment,
+                show_axes,
                 is_example,
             ],
             outputs=[reconstruction_output, log_output, target_dir_output, frame_filter, image_gallery],
@@ -629,6 +680,8 @@ with gr.Blocks(
             show_cam,
             mask_sky,
             prediction_mode,
+            use_gravity_alignment,
+            show_axes,
         ],
         outputs=[reconstruction_output, log_output, frame_filter],
     ).then(
@@ -649,6 +702,8 @@ with gr.Blocks(
             show_cam,
             mask_sky,
             prediction_mode,
+            use_gravity_alignment,
+            show_axes,
             is_example,
         ],
         [reconstruction_output, log_output],
@@ -664,6 +719,8 @@ with gr.Blocks(
             show_cam,
             mask_sky,
             prediction_mode,
+            use_gravity_alignment,
+            show_axes,
             is_example,
         ],
         [reconstruction_output, log_output],
@@ -679,6 +736,8 @@ with gr.Blocks(
             show_cam,
             mask_sky,
             prediction_mode,
+            use_gravity_alignment,
+            show_axes,
             is_example,
         ],
         [reconstruction_output, log_output],
@@ -694,6 +753,8 @@ with gr.Blocks(
             show_cam,
             mask_sky,
             prediction_mode,
+            use_gravity_alignment,
+            show_axes,
             is_example,
         ],
         [reconstruction_output, log_output],
@@ -709,6 +770,8 @@ with gr.Blocks(
             show_cam,
             mask_sky,
             prediction_mode,
+            use_gravity_alignment,
+            show_axes,
             is_example,
         ],
         [reconstruction_output, log_output],
@@ -724,6 +787,8 @@ with gr.Blocks(
             show_cam,
             mask_sky,
             prediction_mode,
+            use_gravity_alignment,
+            show_axes,
             is_example,
         ],
         [reconstruction_output, log_output],
@@ -739,6 +804,42 @@ with gr.Blocks(
             show_cam,
             mask_sky,
             prediction_mode,
+            use_gravity_alignment,
+            show_axes,
+            is_example,
+        ],
+        [reconstruction_output, log_output],
+    )
+    use_gravity_alignment.change(
+        update_visualization,
+        [
+            target_dir_output,
+            conf_thres,
+            frame_filter,
+            mask_black_bg,
+            mask_white_bg,
+            show_cam,
+            mask_sky,
+            prediction_mode,
+            use_gravity_alignment,
+            show_axes,
+            is_example,
+        ],
+        [reconstruction_output, log_output],
+    )
+    show_axes.change(
+        update_visualization,
+        [
+            target_dir_output,
+            conf_thres,
+            frame_filter,
+            mask_black_bg,
+            mask_white_bg,
+            show_cam,
+            mask_sky,
+            prediction_mode,
+            use_gravity_alignment,
+            show_axes,
             is_example,
         ],
         [reconstruction_output, log_output],

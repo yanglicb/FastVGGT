@@ -1,0 +1,13 @@
+{
+  "example_image_001.jpg": {
+    "pitch": -71.35,
+    "note": "Pitch extracted from EXIF: 'Pitch:-71.351295,Roll:-10.72634,Azimuth:-154.74142'"
+  },
+  "example_image_002.jpg": {
+    "pitch": -68.20,
+    "note": "Negative pitch = camera pointing downward (typical for drone/aerial imagery)"
+  },
+  "example_image_003.jpg": {
+    "pitch": -72.10
+  }
+}

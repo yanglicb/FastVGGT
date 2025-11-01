@@ -23,6 +23,8 @@ def predictions_to_glb(
     mask_sky=False,
     target_dir=None,
     prediction_mode="Depthmap and Camera Branch",
+    pitch_angles=None,
+    show_axes=True,
 ) -> trimesh.Scene:
     """
     Converts FastVGGT predictions to a 3D scene represented as a GLB file.
@@ -41,6 +43,8 @@ def predictions_to_glb(
         mask_sky (bool): Apply sky segmentation mask (default: False)
         target_dir (str): Output directory for intermediate files (default: None)
         prediction_mode (str): Prediction mode selector (default: "Depthmap and Camera Branch")
+        pitch_angles (list): Optional list of pitch angles in degrees for gravity alignment (default: None)
+        show_axes (bool): Show coordinate system axes (default: True)
 
     Returns:
         trimesh.Scene: Processed 3D scene containing point cloud and cameras
@@ -164,8 +168,24 @@ def predictions_to_glb(
 
             integrate_camera_into_scene(scene_3d, camera_to_world, current_color, scene_scale)
 
+    # Add coordinate axes if requested
+    if show_axes:
+        axes_scene = create_coordinate_axes(scene_scale)
+        for geom_name, geom in axes_scene.geometry.items():
+            scene_3d.add_geometry(geom, geom_name=geom_name)
+        print(f"Added coordinate axes (scale: {scene_scale * 0.3:.2f})")
+
+    # Compute gravity alignment using EXIF pitch data as absolute reference
+    # combined with inferred camera poses for geometry
+    gravity_alignment = None
+    if pitch_angles is not None and len(pitch_angles) > 0:
+        from metadata_util import compute_gravity_alignment_from_pitch_and_poses
+        # Use EXIF pitch to provide absolute orientation reference
+        # The inferred camera extrinsics provide relative geometry
+        gravity_alignment = compute_gravity_alignment_from_pitch_and_poses(pitch_angles, extrinsics_matrices)
+    
     # Align scene to the observation of the first camera
-    scene_3d = apply_scene_alignment(scene_3d, extrinsics_matrices)
+    scene_3d = apply_scene_alignment(scene_3d, extrinsics_matrices, gravity_alignment)
 
     print("GLB Scene built")
     return scene_3d
@@ -209,9 +229,133 @@ def integrate_camera_into_scene(scene: trimesh.Scene, transform: np.ndarray, fac
     scene.add_geometry(camera_mesh)
 
 
-def apply_scene_alignment(scene_3d: trimesh.Scene, extrinsics_matrices: np.ndarray) -> trimesh.Scene:
+def create_coordinate_axes(scene_scale: float = 1.0, axis_length: float = None) -> trimesh.Scene:
+    """
+    Creates a coordinate system with colored axes (X=Red, Y=Green, Z=Blue).
+    
+    Args:
+        scene_scale: Scale factor based on the scene size
+        axis_length: Optional explicit length for axes. If None, uses scene_scale * 0.3
+        
+    Returns:
+        trimesh.Scene containing the coordinate axes
+    """
+    if axis_length is None:
+        axis_length = scene_scale * 0.3
+    
+    # Axis radius (thickness)
+    axis_radius = axis_length * 0.01
+    arrow_radius = axis_radius * 2.5
+    arrow_height = axis_length * 0.1
+    
+    # Create a scene for the axes
+    axes_scene = trimesh.Scene()
+    
+    # X-axis (Red)
+    x_cylinder = trimesh.creation.cylinder(
+        radius=axis_radius,
+        height=axis_length - arrow_height,
+        sections=16
+    )
+    # Rotate to align with X-axis
+    x_rotation = trimesh.transformations.rotation_matrix(
+        np.pi / 2, [0, 1, 0]
+    )
+    x_translation = trimesh.transformations.translation_matrix(
+        [(axis_length - arrow_height) / 2, 0, 0]
+    )
+    x_cylinder.apply_transform(x_rotation @ x_translation)
+    x_cylinder.visual.vertex_colors = [255, 0, 0, 255]  # Red
+    
+    # X-axis arrow
+    x_arrow = trimesh.creation.cone(
+        radius=arrow_radius,
+        height=arrow_height,
+        sections=16
+    )
+    x_arrow_rotation = trimesh.transformations.rotation_matrix(
+        -np.pi / 2, [0, 0, 1]
+    )
+    x_arrow_translation = trimesh.transformations.translation_matrix(
+        [axis_length - arrow_height / 2, 0, 0]
+    )
+    x_arrow.apply_transform(x_arrow_rotation @ x_arrow_translation)
+    x_arrow.visual.vertex_colors = [255, 0, 0, 255]  # Red
+    
+    # Y-axis (Green)
+    y_cylinder = trimesh.creation.cylinder(
+        radius=axis_radius,
+        height=axis_length - arrow_height,
+        sections=16
+    )
+    y_rotation = trimesh.transformations.rotation_matrix(
+        -np.pi / 2, [1, 0, 0]
+    )
+    y_translation = trimesh.transformations.translation_matrix(
+        [0, (axis_length - arrow_height) / 2, 0]
+    )
+    y_cylinder.apply_transform(y_rotation @ y_translation)
+    y_cylinder.visual.vertex_colors = [0, 255, 0, 255]  # Green
+    
+    # Y-axis arrow
+    y_arrow = trimesh.creation.cone(
+        radius=arrow_radius,
+        height=arrow_height,
+        sections=16
+    )
+    y_arrow_translation = trimesh.transformations.translation_matrix(
+        [0, axis_length - arrow_height / 2, 0]
+    )
+    y_arrow.apply_transform(y_arrow_translation)
+    y_arrow.visual.vertex_colors = [0, 255, 0, 255]  # Green
+    
+    # Z-axis (Blue)
+    z_cylinder = trimesh.creation.cylinder(
+        radius=axis_radius,
+        height=axis_length - arrow_height,
+        sections=16
+    )
+    z_translation = trimesh.transformations.translation_matrix(
+        [0, 0, (axis_length - arrow_height) / 2]
+    )
+    z_cylinder.apply_transform(z_translation)
+    z_cylinder.visual.vertex_colors = [0, 0, 255, 255]  # Blue
+    
+    # Z-axis arrow
+    z_arrow = trimesh.creation.cone(
+        radius=arrow_radius,
+        height=arrow_height,
+        sections=16
+    )
+    z_arrow_rotation = trimesh.transformations.rotation_matrix(
+        np.pi, [1, 0, 0]
+    )
+    z_arrow_translation = trimesh.transformations.translation_matrix(
+        [0, 0, axis_length - arrow_height / 2]
+    )
+    z_arrow.apply_transform(z_arrow_rotation @ z_arrow_translation)
+    z_arrow.visual.vertex_colors = [0, 0, 255, 255]  # Blue
+    
+    # Add all components to the scene
+    axes_scene.add_geometry(x_cylinder, geom_name='x_axis')
+    axes_scene.add_geometry(x_arrow, geom_name='x_arrow')
+    axes_scene.add_geometry(y_cylinder, geom_name='y_axis')
+    axes_scene.add_geometry(y_arrow, geom_name='y_arrow')
+    axes_scene.add_geometry(z_cylinder, geom_name='z_axis')
+    axes_scene.add_geometry(z_arrow, geom_name='z_arrow')
+    
+    return axes_scene
+
+
+def apply_scene_alignment(scene_3d: trimesh.Scene, extrinsics_matrices: np.ndarray,
+                         gravity_alignment: np.ndarray = None) -> trimesh.Scene:
     """
     Aligns the 3D scene based on the extrinsics of the first camera.
+    
+    Args:
+        scene_3d: The 3D scene to align
+        extrinsics_matrices: Camera extrinsic matrices
+        gravity_alignment: Optional 4x4 transformation to align with gravity/world coordinates
     """
     # Set transformations for scene alignment
     opengl_conversion_matrix = get_opengl_conversion_matrix()
@@ -222,6 +366,12 @@ def apply_scene_alignment(scene_3d: trimesh.Scene, extrinsics_matrices: np.ndarr
 
     # Apply transformation
     initial_transformation = np.linalg.inv(extrinsics_matrices[0]) @ opengl_conversion_matrix @ align_rotation
+    
+    # Apply gravity alignment if provided
+    if gravity_alignment is not None:
+        print("Applying gravity alignment to align z-axis with real world")
+        initial_transformation = gravity_alignment @ initial_transformation
+    
     scene_3d.apply_transform(initial_transformation)
     return scene_3d
 
