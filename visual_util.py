@@ -25,6 +25,7 @@ def predictions_to_glb(
     prediction_mode="Depthmap and Camera Branch",
     pitch_angles=None,
     show_axes=True,
+    reference_camera_idx=None,
 ) -> trimesh.Scene:
     """
     Converts FastVGGT predictions to a 3D scene represented as a GLB file.
@@ -45,6 +46,7 @@ def predictions_to_glb(
         prediction_mode (str): Prediction mode selector (default: "Depthmap and Camera Branch")
         pitch_angles (list): Optional list of pitch angles in degrees for gravity alignment (default: None)
         show_axes (bool): Show coordinate system axes (default: True)
+        reference_camera_idx (int): Optional index of camera to use as gravity reference (0-based, default: None uses average)
 
     Returns:
         trimesh.Scene: Processed 3D scene containing point cloud and cameras
@@ -168,13 +170,6 @@ def predictions_to_glb(
 
             integrate_camera_into_scene(scene_3d, camera_to_world, current_color, scene_scale)
 
-    # Add coordinate axes if requested
-    if show_axes:
-        axes_scene = create_coordinate_axes(scene_scale)
-        for geom_name, geom in axes_scene.geometry.items():
-            scene_3d.add_geometry(geom, geom_name=geom_name)
-        print(f"Added coordinate axes (scale: {scene_scale * 0.3:.2f})")
-
     # Compute gravity alignment using EXIF pitch data as absolute reference
     # combined with inferred camera poses for geometry
     gravity_alignment = None
@@ -182,10 +177,33 @@ def predictions_to_glb(
         from metadata_util import compute_gravity_alignment_from_pitch_and_poses
         # Use EXIF pitch to provide absolute orientation reference
         # The inferred camera extrinsics provide relative geometry
-        gravity_alignment = compute_gravity_alignment_from_pitch_and_poses(pitch_angles, extrinsics_matrices)
+        gravity_alignment = compute_gravity_alignment_from_pitch_and_poses(
+            pitch_angles, extrinsics_matrices, reference_camera_idx
+        )
+    
+    # Add coordinate axes BEFORE alignment if requested (to show original orientation)
+    if show_axes:
+        # Add original axes in lighter colors (before alignment)
+        axes_scene_before = create_coordinate_axes(scene_scale, prefix="original_", 
+                                                     colors=[(255, 150, 150, 128),  # Light red
+                                                             (150, 255, 150, 128),  # Light green
+                                                             (150, 150, 255, 128)]) # Light blue
+        for geom_name, geom in axes_scene_before.geometry.items():
+            scene_3d.add_geometry(geom, geom_name=geom_name)
+        print(f"Added original coordinate axes (before alignment) - lighter colors")
     
     # Align scene to the observation of the first camera
     scene_3d = apply_scene_alignment(scene_3d, extrinsics_matrices, gravity_alignment)
+    
+    # Add coordinate axes AFTER alignment if requested (to show aligned orientation)
+    if show_axes:
+        axes_scene_after = create_coordinate_axes(scene_scale, prefix="aligned_",
+                                                    colors=[(255, 0, 0, 255),    # Bright red
+                                                            (0, 255, 0, 255),    # Bright green
+                                                            (0, 0, 255, 255)])   # Bright blue
+        for geom_name, geom in axes_scene_after.geometry.items():
+            scene_3d.add_geometry(geom, geom_name=geom_name)
+        print(f"Added aligned coordinate axes (after alignment) - bright colors (scale: {scene_scale * 0.3:.2f})")
 
     print("GLB Scene built")
     return scene_3d
@@ -229,13 +247,21 @@ def integrate_camera_into_scene(scene: trimesh.Scene, transform: np.ndarray, fac
     scene.add_geometry(camera_mesh)
 
 
-def create_coordinate_axes(scene_scale: float = 1.0, axis_length: float = None) -> trimesh.Scene:
+def create_coordinate_axes(
+    scene_scale: float = 1.0, 
+    axis_length: float = None,
+    prefix: str = "",
+    colors: list = None
+) -> trimesh.Scene:
     """
     Creates a coordinate system with colored axes (X=Red, Y=Green, Z=Blue).
     
     Args:
         scene_scale: Scale factor based on the scene size
         axis_length: Optional explicit length for axes. If None, uses scene_scale * 0.3
+        prefix: Optional prefix for geometry names (e.g., "original_", "aligned_")
+        colors: Optional list of RGBA tuples for [X, Y, Z] axes. 
+                Default: [(255,0,0,255), (0,255,0,255), (0,0,255,255)]
         
     Returns:
         trimesh.Scene containing the coordinate axes
@@ -243,59 +269,59 @@ def create_coordinate_axes(scene_scale: float = 1.0, axis_length: float = None) 
     if axis_length is None:
         axis_length = scene_scale * 0.3
     
+    # Default colors: X=Red, Y=Green, Z=Blue
+    if colors is None:
+        colors = [(255, 0, 0, 255), (0, 255, 0, 255), (0, 0, 255, 255)]
+    
     # Axis radius (thickness)
     axis_radius = axis_length * 0.01
     arrow_radius = axis_radius * 2.5
-    arrow_height = axis_length * 0.1
+    arrow_height = axis_length * 0.15
+    
+    # Calculate lengths
+    cylinder_length = axis_length - arrow_height
     
     # Create a scene for the axes
     axes_scene = trimesh.Scene()
     
-    # X-axis (Red)
+    # ========== X-axis (Red or custom color) ==========
+    # Create cylinder centered at origin, extending along Z-axis by default
     x_cylinder = trimesh.creation.cylinder(
         radius=axis_radius,
-        height=axis_length - arrow_height,
+        height=cylinder_length,
         sections=16
     )
-    # Rotate to align with X-axis
-    x_rotation = trimesh.transformations.rotation_matrix(
-        np.pi / 2, [0, 1, 0]
-    )
-    x_translation = trimesh.transformations.translation_matrix(
-        [(axis_length - arrow_height) / 2, 0, 0]
-    )
-    x_cylinder.apply_transform(x_rotation @ x_translation)
-    x_cylinder.visual.vertex_colors = [255, 0, 0, 255]  # Red
+    # Rotate to align with X-axis and translate to position
+    # Cylinder center should be at cylinder_length/2 along X
+    x_cyl_rotation = trimesh.transformations.rotation_matrix(np.pi / 2, [0, 1, 0])
+    x_cyl_translation = trimesh.transformations.translation_matrix([cylinder_length / 2, 0, 0])
+    x_cylinder.apply_transform(x_cyl_translation @ x_cyl_rotation)
+    x_cylinder.visual.vertex_colors = colors[0]
     
-    # X-axis arrow
+    # Create arrow cone (default: base at origin, tip pointing up along Z)
     x_arrow = trimesh.creation.cone(
         radius=arrow_radius,
         height=arrow_height,
         sections=16
     )
-    x_arrow_rotation = trimesh.transformations.rotation_matrix(
-        -np.pi / 2, [0, 0, 1]
-    )
-    x_arrow_translation = trimesh.transformations.translation_matrix(
-        [axis_length - arrow_height / 2, 0, 0]
-    )
-    x_arrow.apply_transform(x_arrow_rotation @ x_arrow_translation)
-    x_arrow.visual.vertex_colors = [255, 0, 0, 255]  # Red
+    # Rotate to point along +X and translate to end of cylinder
+    # Cone tip should be at axis_length along X
+    x_arrow_rotation = trimesh.transformations.rotation_matrix(np.pi / 2, [0, 1, 0])
+    x_arrow_translation = trimesh.transformations.translation_matrix([cylinder_length + arrow_height / 2, 0, 0])
+    x_arrow.apply_transform(x_arrow_translation @ x_arrow_rotation)
+    x_arrow.visual.vertex_colors = colors[0]
     
-    # Y-axis (Green)
+    # ========== Y-axis (Green or custom color) ==========
     y_cylinder = trimesh.creation.cylinder(
         radius=axis_radius,
-        height=axis_length - arrow_height,
+        height=cylinder_length,
         sections=16
     )
-    y_rotation = trimesh.transformations.rotation_matrix(
-        -np.pi / 2, [1, 0, 0]
-    )
-    y_translation = trimesh.transformations.translation_matrix(
-        [0, (axis_length - arrow_height) / 2, 0]
-    )
-    y_cylinder.apply_transform(y_rotation @ y_translation)
-    y_cylinder.visual.vertex_colors = [0, 255, 0, 255]  # Green
+    # Rotate to align with Y-axis and translate
+    y_cyl_rotation = trimesh.transformations.rotation_matrix(np.pi / 2, [1, 0, 0])
+    y_cyl_translation = trimesh.transformations.translation_matrix([0, cylinder_length / 2, 0])
+    y_cylinder.apply_transform(y_cyl_translation @ y_cyl_rotation)
+    y_cylinder.visual.vertex_colors = colors[1]
     
     # Y-axis arrow
     y_arrow = trimesh.creation.cone(
@@ -303,23 +329,22 @@ def create_coordinate_axes(scene_scale: float = 1.0, axis_length: float = None) 
         height=arrow_height,
         sections=16
     )
-    y_arrow_translation = trimesh.transformations.translation_matrix(
-        [0, axis_length - arrow_height / 2, 0]
-    )
-    y_arrow.apply_transform(y_arrow_translation)
-    y_arrow.visual.vertex_colors = [0, 255, 0, 255]  # Green
+    # Rotate to point along +Y and translate to end of cylinder
+    y_arrow_rotation = trimesh.transformations.rotation_matrix(np.pi / 2, [1, 0, 0])
+    y_arrow_translation = trimesh.transformations.translation_matrix([0, cylinder_length + arrow_height / 2, 0])
+    y_arrow.apply_transform(y_arrow_translation @ y_arrow_rotation)
+    y_arrow.visual.vertex_colors = colors[1]
     
-    # Z-axis (Blue)
+    # ========== Z-axis (Blue or custom color) ==========
     z_cylinder = trimesh.creation.cylinder(
         radius=axis_radius,
-        height=axis_length - arrow_height,
+        height=cylinder_length,
         sections=16
     )
-    z_translation = trimesh.transformations.translation_matrix(
-        [0, 0, (axis_length - arrow_height) / 2]
-    )
-    z_cylinder.apply_transform(z_translation)
-    z_cylinder.visual.vertex_colors = [0, 0, 255, 255]  # Blue
+    # Already aligned with Z-axis, just translate
+    z_cyl_translation = trimesh.transformations.translation_matrix([0, 0, cylinder_length / 2])
+    z_cylinder.apply_transform(z_cyl_translation)
+    z_cylinder.visual.vertex_colors = colors[2]
     
     # Z-axis arrow
     z_arrow = trimesh.creation.cone(
@@ -327,22 +352,18 @@ def create_coordinate_axes(scene_scale: float = 1.0, axis_length: float = None) 
         height=arrow_height,
         sections=16
     )
-    z_arrow_rotation = trimesh.transformations.rotation_matrix(
-        np.pi, [1, 0, 0]
-    )
-    z_arrow_translation = trimesh.transformations.translation_matrix(
-        [0, 0, axis_length - arrow_height / 2]
-    )
-    z_arrow.apply_transform(z_arrow_rotation @ z_arrow_translation)
-    z_arrow.visual.vertex_colors = [0, 0, 255, 255]  # Blue
+    # Already pointing up along +Z, just translate to end of cylinder
+    z_arrow_translation = trimesh.transformations.translation_matrix([0, 0, cylinder_length + arrow_height / 2])
+    z_arrow.apply_transform(z_arrow_translation)
+    z_arrow.visual.vertex_colors = colors[2]
     
-    # Add all components to the scene
-    axes_scene.add_geometry(x_cylinder, geom_name='x_axis')
-    axes_scene.add_geometry(x_arrow, geom_name='x_arrow')
-    axes_scene.add_geometry(y_cylinder, geom_name='y_axis')
-    axes_scene.add_geometry(y_arrow, geom_name='y_arrow')
-    axes_scene.add_geometry(z_cylinder, geom_name='z_axis')
-    axes_scene.add_geometry(z_arrow, geom_name='z_arrow')
+    # Add all components to the scene with optional prefix
+    axes_scene.add_geometry(x_cylinder, geom_name=f'{prefix}x_axis')
+    axes_scene.add_geometry(x_arrow, geom_name=f'{prefix}x_arrow')
+    axes_scene.add_geometry(y_cylinder, geom_name=f'{prefix}y_axis')
+    axes_scene.add_geometry(y_arrow, geom_name=f'{prefix}y_arrow')
+    axes_scene.add_geometry(z_cylinder, geom_name=f'{prefix}z_axis')
+    axes_scene.add_geometry(z_arrow, geom_name=f'{prefix}z_arrow')
     
     return axes_scene
 

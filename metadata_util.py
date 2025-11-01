@@ -163,27 +163,211 @@ def get_pitch_angles(image_paths: List[str], metadata_path: Optional[str] = None
     return pitch_angles
 
 
+def compute_gravity_alignment_from_single_camera(
+    pitch_angles: List[Optional[float]],
+    extrinsics: np.ndarray,
+    camera_idx: int,
+) -> np.ndarray:
+    """
+    Compute gravity alignment using a single camera as reference.
+    This provides more precise alignment when one camera has reliable pitch data.
+    
+    IMPORTANT: Camera coordinate system has Z-axis pointing forward (viewing direction),
+    but physical world has Z-axis pointing up (vertical/gravity direction).
+    This function computes the alignment to make world Z-axis point up.
+    
+    Args:
+        pitch_angles: List of pitch angles in degrees from EXIF/metadata
+                     (pitch relative to horizontal: -90° = horizontal, 0° = pointing down)
+        extrinsics: Camera extrinsic matrices (N, 3, 4) or (N, 4, 4) from model
+        camera_idx: Index of the camera to use as reference (0-based)
+        
+    Returns:
+        4x4 transformation matrix to align world z-axis with gravity (vertical up)
+    """
+    # Validate camera index
+    if camera_idx < 0 or camera_idx >= len(extrinsics):
+        print(f"Warning: Invalid camera index {camera_idx}. Using camera 0.")
+        camera_idx = 0
+    
+    # Get pitch angle for the reference camera
+    if camera_idx >= len(pitch_angles):
+        print(f"Warning: No pitch angle for camera {camera_idx}. Using average.")
+        valid_pitches = [p for p in pitch_angles if p is not None]
+        if valid_pitches:
+            pitch_value = np.mean(valid_pitches)
+        else:
+            print("Warning: No valid pitch angles. Computing from camera pose only.")
+            return compute_gravity_alignment_from_camera_vectors(extrinsics, camera_idx)
+    else:
+        pitch_value = pitch_angles[camera_idx]
+        if pitch_value is None:
+            valid_pitches = [p for p in pitch_angles if p is not None]
+            if valid_pitches:
+                pitch_value = np.mean(valid_pitches)
+                print(f"Camera {camera_idx} has no pitch data, using average: {pitch_value:.2f}°")
+            else:
+                print("Warning: No valid pitch angles. Computing from camera pose only.")
+                return compute_gravity_alignment_from_camera_vectors(extrinsics, camera_idx)
+    
+    print(f"Using camera {camera_idx} with pitch {pitch_value:.2f}° for gravity alignment")
+    
+    # Prepare extrinsics as 4x4 matrices
+    if extrinsics.shape[-2:] == (3, 4):
+        num_cams = len(extrinsics)
+        ext_4x4 = np.zeros((num_cams, 4, 4))
+        ext_4x4[:, :3, :4] = extrinsics
+        ext_4x4[:, 3, 3] = 1
+    else:
+        ext_4x4 = extrinsics
+    
+    # Get the world-to-camera matrix for the reference camera
+    world_to_cam = ext_4x4[camera_idx]
+    
+    try:
+        cam_to_world = np.linalg.inv(world_to_cam)
+    except np.linalg.LinAlgError:
+        print(f"Warning: Could not invert camera matrix for camera {camera_idx}")
+        return np.eye(4)
+    
+    # Extract rotation matrix
+    R_cw = cam_to_world[:3, :3]
+    
+    # Camera coordinate system: X=down, Y=left, Z=forward
+    # Camera's up direction is -X (opposite of down)
+    up_camera = np.array([-1, 0, 0])
+    
+    # Transform camera's up vector to world coordinates
+    up_world_from_pose = R_cw @ up_camera
+    up_norm = np.linalg.norm(up_world_from_pose)
+    
+    if up_norm < 1e-6:
+        print("Warning: Up vector is degenerate")
+        return np.eye(4)
+    
+    up_world_from_pose = up_world_from_pose / up_norm
+    
+    # Calculate predicted pitch from the up vector
+    # pitch = -90° means camera horizontal (up vector perpendicular to gravity)
+    # pitch = 0° means camera vertical (up vector parallel to gravity)
+    # The angle between up vector and world Z-axis tells us the pitch
+    pred_pitch = 90.0 - np.degrees(np.arccos(np.clip(up_world_from_pose[2], -1.0, 1.0)))
+    print(f"  Predicted pitch from camera up vector: {pred_pitch:.2f}°")
+    
+    # Unwrap pitch value to match predicted pitch
+    candidates = [pitch_value, pitch_value - 180.0, pitch_value + 180.0]
+    adjusted_pitch = min(candidates, key=lambda ang: abs(ang - pred_pitch))
+    print(f"  Adjusted EXIF pitch: {adjusted_pitch:.2f}°")
+    
+    # Build expected up vector from pitch angle
+    # pitch = -90° -> up vector horizontal (perpendicular to Z)
+    # pitch = 0° -> up vector vertical (parallel to Z)
+    pitch_angle_from_horizontal = adjusted_pitch + 90.0  # Convert to angle from horizontal
+    
+    # The up vector should have:
+    # - Z component based on pitch: sin(pitch_from_horizontal)
+    # - Horizontal component: cos(pitch_from_horizontal)
+    expected_z = np.sin(np.radians(pitch_angle_from_horizontal))
+    expected_horizontal_mag = np.cos(np.radians(pitch_angle_from_horizontal))
+    
+    # Keep horizontal direction from predicted up vector
+    horizontal = up_world_from_pose.copy()
+    horizontal[2] = 0.0
+    horiz_norm = np.linalg.norm(horizontal)
+    
+    if horiz_norm < 1e-6:
+        # Up vector is purely vertical - just use Z direction
+        expected_up = np.array([0.0, 0.0, np.sign(expected_z) if abs(expected_z) > 1e-6 else 1.0])
+    else:
+        horizontal_dir = horizontal / horiz_norm
+        expected_up = horizontal_dir * expected_horizontal_mag + np.array([0.0, 0.0, expected_z])
+    
+    exp_norm = np.linalg.norm(expected_up)
+    if exp_norm < 1e-6:
+        print("Warning: Expected up vector is degenerate")
+        return np.eye(4)
+    
+    expected_up = expected_up / exp_norm
+    
+    # Now we need to align up_world_from_pose to expected_up
+    # But our goal is to align the world Z-axis with gravity (up direction)
+    # So we compute rotation to align expected_up to world Z-axis [0, 0, 1]
+    target_up = np.array([0.0, 0.0, 1.0])
+    
+    # Compute rotation using Rodrigues' formula
+    v = np.cross(expected_up, target_up)
+    s = np.linalg.norm(v)
+    c = np.dot(expected_up, target_up)
+    
+    gravity_alignment = np.eye(4)
+    
+    if s < 1e-6:
+        if c < 0:
+            # 180-degree rotation: choose an arbitrary axis orthogonal to expected_up
+            axis = np.cross(expected_up, np.array([1.0, 0.0, 0.0]))
+            if np.linalg.norm(axis) < 1e-6:
+                axis = np.cross(expected_up, np.array([0.0, 1.0, 0.0]))
+            axis_norm = np.linalg.norm(axis)
+            if axis_norm < 1e-6:
+                return gravity_alignment
+            axis = axis / axis_norm
+            gravity_alignment[:3, :3] = Rotation.from_rotvec(np.pi * axis).as_matrix()
+            print("  Applied 180° flip to align up vectors")
+        else:
+            print("  Up vector already aligned with world Z-axis (vertical)")
+        return gravity_alignment
+    
+    # Rodrigues' rotation formula
+    vx = np.array(
+        [[0, -v[2], v[1]],
+         [v[2], 0, -v[0]],
+         [-v[1], v[0], 0]]
+    )
+    
+    rotation_matrix = np.eye(3) + vx + vx @ vx * ((1 - c) / (s * s))
+    gravity_alignment[:3, :3] = rotation_matrix
+    
+    rotation_angle = np.degrees(np.arctan2(s, c))
+    print(f"  Rotation angle to align: {rotation_angle:.2f}°")
+    
+    return gravity_alignment
+
+
 def compute_gravity_alignment_from_pitch_and_poses(
     pitch_angles: List[Optional[float]],
     extrinsics: np.ndarray,
+    reference_camera_idx: Optional[int] = None,
 ) -> np.ndarray:
     """
     Compute gravity alignment by combining EXIF pitch data (absolute reference)
     with inferred camera poses (relative geometry).
     
+    IMPORTANT: This aligns the world Z-axis with the gravity direction (vertical up),
+    not with the camera's forward direction.
+    
     Args:
         pitch_angles: List of pitch angles in degrees from EXIF/metadata
+                     (pitch relative to horizontal: -90° = horizontal, 0° = pointing down)
         extrinsics: Camera extrinsic matrices (N, 3, 4) or (N, 4, 4) from model
+        reference_camera_idx: Optional index of camera to use as reference (0-based).
+                            If None, uses average of all cameras.
         
     Returns:
-        4x4 transformation matrix to align z-axis with world up vector
+        4x4 transformation matrix to align world z-axis with gravity (vertical up)
     """
     # Filter out None values
     valid_pitches = [p for p in pitch_angles if p is not None]
 
     if not valid_pitches:
         print("Warning: No valid pitch angles found. Computing alignment from camera poses only.")
-        return compute_gravity_alignment_from_camera_vectors(extrinsics)
+        return compute_gravity_alignment_from_camera_vectors(extrinsics, reference_camera_idx)
+
+    # If reference camera is specified, use it for calibration
+    if reference_camera_idx is not None:
+        print(f"Using camera #{reference_camera_idx} as reference for gravity alignment")
+        return compute_gravity_alignment_from_single_camera(
+            pitch_angles, extrinsics, reference_camera_idx
+        )
 
     # Compute average pitch from EXIF data (absolute reference)
     avg_pitch = np.mean(valid_pitches)
@@ -199,8 +383,8 @@ def compute_gravity_alignment_from_pitch_and_poses(
         ext_4x4 = extrinsics
 
     predicted_pitches = []
-    pred_forward_vectors = []
-    target_forward_vectors = []
+    pred_up_vectors = []
+    target_up_vectors = []
     aligned_pitch_values = []
 
     for idx, world_to_cam in enumerate(ext_4x4):
@@ -210,19 +394,24 @@ def compute_gravity_alignment_from_pitch_and_poses(
             continue
 
         R_cw = cam_to_world[:3, :3]
-        forward_world = R_cw[:, 2]
-        forward_norm = np.linalg.norm(forward_world)
-        if forward_norm < 1e-6:
+        
+        # Camera coordinate system: X=down, Y=left, Z=forward
+        # Camera's up direction is -X (opposite of down)
+        up_camera = np.array([-1, 0, 0])
+        up_world = R_cw @ up_camera
+        up_norm = np.linalg.norm(up_world)
+        if up_norm < 1e-6:
             continue
-        forward_world = forward_world / forward_norm
-        pred_forward_vectors.append(forward_world)
+        up_world = up_world / up_norm
+        pred_up_vectors.append(up_world)
 
-        # Pitch convention: -90° = camera horizontal, 0° = camera vertical down
-        val = np.clip(-forward_world[2], -1.0, 1.0)
-        pred_pitch = np.degrees(np.arcsin(val)) - 90.0
+        # Calculate predicted pitch from the up vector
+        # pitch = -90° means camera horizontal (up vector perpendicular to Z)
+        # pitch = 0° means camera pointing down (up vector parallel to Z)
+        pred_pitch = 90.0 - np.degrees(np.arccos(np.clip(up_world[2], -1.0, 1.0)))
         predicted_pitches.append(pred_pitch)
 
-        # Build expected forward vector that matches EXIF pitch but keeps horizontal direction
+        # Build expected up vector that matches EXIF pitch but keeps horizontal direction
         if idx < len(pitch_angles):
             pitch_value = pitch_angles[idx]
         else:
@@ -236,27 +425,33 @@ def compute_gravity_alignment_from_pitch_and_poses(
         adjusted_pitch = min(candidates, key=lambda ang: abs(ang - pred_pitch))
         aligned_pitch_values.append(adjusted_pitch)
 
-        theta = np.radians(adjusted_pitch + 90.0)
-        expected_vertical = -np.sin(theta)
-        expected_horizontal_mag = np.cos(theta)
+        # Convert pitch to up vector components
+        pitch_angle_from_horizontal = adjusted_pitch + 90.0
+        expected_z = np.sin(np.radians(pitch_angle_from_horizontal))
+        expected_horizontal_mag = np.cos(np.radians(pitch_angle_from_horizontal))
 
-        horizontal = forward_world.copy()
+        # Keep horizontal direction from predicted up vector
+        horizontal = up_world.copy()
         horizontal[2] = 0.0
         horiz_norm = np.linalg.norm(horizontal)
 
         if horiz_norm < 1e-6:
-            expected_forward = np.array([0.0, 0.0, expected_vertical])
+            expected_up = np.array([0.0, 0.0, np.sign(expected_z) if abs(expected_z) > 1e-6 else 1.0])
         else:
             horizontal_dir = horizontal / horiz_norm
-            expected_forward = horizontal_dir * expected_horizontal_mag + np.array([0.0, 0.0, expected_vertical])
+            expected_up = horizontal_dir * expected_horizontal_mag + np.array([0.0, 0.0, expected_z])
 
-        exp_norm = np.linalg.norm(expected_forward)
+        exp_norm = np.linalg.norm(expected_up)
         if exp_norm < 1e-6:
-            expected_forward = forward_world
+            expected_up = up_world
         else:
-            expected_forward = expected_forward / exp_norm
+            expected_up = expected_up / exp_norm
 
-        target_forward_vectors.append(expected_forward)
+        target_up_vectors.append(expected_up)
+
+    if not predicted_pitches:
+        print("Warning: Could not derive predicted pitches from camera poses. Falling back to EXIF-only alignment.")
+        return compute_gravity_alignment_from_pitch(pitch_angles)
 
     if not predicted_pitches:
         print("Warning: Could not derive predicted pitches from camera poses. Falling back to EXIF-only alignment.")
@@ -269,44 +464,48 @@ def compute_gravity_alignment_from_pitch_and_poses(
         avg_aligned_pitch = np.mean(aligned_pitch_values)
         print(f"Average EXIF pitch after unwrapping: {avg_aligned_pitch:.2f}°")
 
-    if not target_forward_vectors:
-        print("Warning: Could not build expected forward vectors, using pitch-only alignment.")
+    if not target_up_vectors:
+        print("Warning: Could not build expected up vectors, using pitch-only alignment.")
         return compute_gravity_alignment_from_pitch(pitch_angles)
 
-    avg_pred_forward = np.mean(pred_forward_vectors, axis=0)
-    avg_target_forward = np.mean(target_forward_vectors, axis=0)
+    # Average the up vectors
+    avg_pred_up = np.mean(pred_up_vectors, axis=0)
+    avg_target_up = np.mean(target_up_vectors, axis=0)
 
-    pred_norm = np.linalg.norm(avg_pred_forward)
-    target_norm = np.linalg.norm(avg_target_forward)
+    pred_norm = np.linalg.norm(avg_pred_up)
+    target_norm = np.linalg.norm(avg_target_up)
 
     if pred_norm < 1e-6 or target_norm < 1e-6:
-        print("Warning: Forward vectors degenerate, using pitch-only alignment.")
+        print("Warning: Up vectors degenerate, using pitch-only alignment.")
         return compute_gravity_alignment_from_pitch(pitch_angles)
 
-    avg_pred_forward = avg_pred_forward / pred_norm
-    avg_target_forward = avg_target_forward / target_norm
+    avg_pred_up = avg_pred_up / pred_norm
+    avg_target_up = avg_target_up / target_norm
 
-    v = np.cross(avg_pred_forward, avg_target_forward)
+    # Align target_up to world Z-axis (vertical up)
+    target_world_up = np.array([0.0, 0.0, 1.0])
+    
+    v = np.cross(avg_target_up, target_world_up)
     s = np.linalg.norm(v)
-    c = np.dot(avg_pred_forward, avg_target_forward)
+    c = np.dot(avg_target_up, target_world_up)
 
     gravity_alignment = np.eye(4)
 
     if s < 1e-6:
         if c < 0:
-            # 180-degree rotation: choose an arbitrary axis orthogonal to avg_pred_forward
-            axis = np.cross(avg_pred_forward, np.array([1.0, 0.0, 0.0]))
+            # 180-degree rotation: choose an arbitrary axis orthogonal to avg_target_up
+            axis = np.cross(avg_target_up, np.array([1.0, 0.0, 0.0]))
             if np.linalg.norm(axis) < 1e-6:
-                axis = np.cross(avg_pred_forward, np.array([0.0, 1.0, 0.0]))
+                axis = np.cross(avg_target_up, np.array([0.0, 1.0, 0.0]))
             axis_norm = np.linalg.norm(axis)
             if axis_norm < 1e-6:
                 return gravity_alignment  # give up, identity
             axis = axis / axis_norm
             gravity_alignment[:3, :3] = Rotation.from_rotvec(np.pi * axis).as_matrix()
-            print("Applied 180° flip to align forward vectors.")
+            print("Applied 180° flip to align up vectors with world Z-axis.")
             return gravity_alignment
         else:
-            print("Predicted forward already aligned with expected orientation.")
+            print("Up vectors already aligned with world Z-axis (vertical).")
             return gravity_alignment
 
     vx = np.array(
@@ -319,7 +518,7 @@ def compute_gravity_alignment_from_pitch_and_poses(
     gravity_alignment[:3, :3] = rotation_matrix
 
     rotation_angle = np.degrees(np.arctan2(s, c))
-    print(f"Forward-vector alignment rotation: {rotation_angle:.2f}°")
+    print(f"Up-vector alignment rotation to vertical: {rotation_angle:.2f}°")
 
     return gravity_alignment
 
@@ -367,16 +566,25 @@ def compute_gravity_alignment_from_pitch(pitch_angles: List[Optional[float]]) ->
     return gravity_alignment
 
 
-def compute_gravity_alignment_from_camera_vectors(extrinsics: np.ndarray) -> np.ndarray:
+def compute_gravity_alignment_from_camera_vectors(extrinsics: np.ndarray, reference_camera_idx: Optional[int] = None) -> np.ndarray:
     """
     Compute gravity alignment by analyzing the up vectors of cameras.
     Uses the actual inferred camera poses from the reconstruction model.
     
+    IMPORTANT: Aligns world Z-axis with gravity (vertical up direction).
+    Camera coordinate system convention:
+    - X-axis: down
+    - Y-axis: left
+    - Z-axis: forward (viewing direction)
+    - Up direction: -X
+    
     Args:
         extrinsics: Camera extrinsic matrices (N, 3, 4) or (N, 4, 4)
+        reference_camera_idx: Optional index of camera to use as reference (0-based).
+                            If None, uses average of all cameras.
         
     Returns:
-        4x4 transformation matrix to align z-axis with world up vector
+        4x4 transformation matrix to align world z-axis with gravity (vertical up)
     """
     num_cameras = len(extrinsics)
     
@@ -393,19 +601,35 @@ def compute_gravity_alignment_from_camera_vectors(extrinsics: np.ndarray) -> np.
     for i in range(num_cameras):
         cam_to_world[i] = np.linalg.inv(ext_4x4[i])
     
-    # Extract up vectors from camera coordinate systems
-    # In camera space: X=right, Y=down, Z=forward (OpenCV convention)
-    # So the camera's "up" direction is -Y in camera space
-    up_vectors = []
-    for i in range(num_cameras):
-        # Camera's up direction in camera coordinates (negative Y axis)
-        up_cam = np.array([0, -1, 0, 0])
+    # If using a single reference camera
+    if reference_camera_idx is not None:
+        if reference_camera_idx < 0 or reference_camera_idx >= num_cameras:
+            print(f"Warning: Invalid camera index {reference_camera_idx}. Using camera 0.")
+            reference_camera_idx = 0
+        
+        print(f"Computing gravity alignment from camera #{reference_camera_idx} up vector")
+        
+        # Camera coordinate system: X=down, Y=left, Z=forward
+        # Camera's up direction is -X (opposite of down)
+        up_cam = np.array([-1, 0, 0, 0])
         # Transform to world coordinates
-        up_world = cam_to_world[i] @ up_cam
-        up_vectors.append(up_world[:3])
+        avg_up = (cam_to_world[reference_camera_idx] @ up_cam)[:3]
+    else:
+        # Extract up vectors from camera coordinate systems
+        # Camera coordinate system: X=down, Y=left, Z=forward
+        # Camera's up direction is -X (opposite of down)
+        up_vectors = []
+        for i in range(num_cameras):
+            # Camera coordinate system: X=down, Y=left, Z=forward
+            # Camera's up direction is -X (opposite of down)
+            up_cam = np.array([-1, 0, 0, 0])
+            # Transform to world coordinates
+            up_world = cam_to_world[i] @ up_cam
+            up_vectors.append(up_world[:3])
+        
+        # Average up vector across all cameras
+        avg_up = np.mean(up_vectors, axis=0)
     
-    # Average up vector across all cameras
-    avg_up = np.mean(up_vectors, axis=0)
     avg_up_norm = np.linalg.norm(avg_up)
     
     if avg_up_norm < 1e-6:
@@ -446,8 +670,13 @@ def compute_gravity_alignment_from_camera_vectors(extrinsics: np.ndarray) -> np.
     # Compute angle of rotation for logging
     rotation_angle = np.arccos(np.clip(c, -1.0, 1.0)) * 180 / np.pi
     
-    print(f"Gravity alignment computed from {num_cameras} inferred camera poses")
-    print(f"  Average camera up vector (world): [{avg_up[0]:.3f}, {avg_up[1]:.3f}, {avg_up[2]:.3f}]")
-    print(f"  Rotation angle to align with Z-axis: {rotation_angle:.2f}°")
+    if reference_camera_idx is not None:
+        print(f"Gravity alignment computed from camera #{reference_camera_idx} pose")
+        print(f"  Camera up vector (world): [{avg_up[0]:.3f}, {avg_up[1]:.3f}, {avg_up[2]:.3f}]")
+        print(f"  Rotation angle to align with Z-axis: {rotation_angle:.2f}°")
+    else:
+        print(f"Gravity alignment computed from {num_cameras} inferred camera poses")
+        print(f"  Average camera up vector (world): [{avg_up[0]:.3f}, {avg_up[1]:.3f}, {avg_up[2]:.3f}]")
+        print(f"  Rotation angle to align with Z-axis: {rotation_angle:.2f}°")
     
     return alignment

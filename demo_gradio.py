@@ -261,6 +261,7 @@ def gradio_demo(
     prediction_mode="Depthmap and Camera Branch",
     use_gravity_alignment=True,
     show_axes=True,
+    reference_camera_idx=None,
 ):
     """
     Perform reconstruction using the already-created target_dir/images.
@@ -293,7 +294,7 @@ def gradio_demo(
     # Build a GLB file name
     glbfile = os.path.join(
         target_dir,
-        f"glbscene_{conf_thres}_{frame_filter.replace('.', '_').replace(':', '').replace(' ', '_')}_maskb{mask_black_bg}_maskw{mask_white_bg}_cam{show_cam}_sky{mask_sky}_pred{prediction_mode.replace(' ', '_')}_gravity{use_gravity_alignment}_axes{show_axes}.glb",
+        f"glbscene_{conf_thres}_{frame_filter.replace('.', '_').replace(':', '').replace(' ', '_')}_maskb{mask_black_bg}_maskw{mask_white_bg}_cam{show_cam}_sky{mask_sky}_pred{prediction_mode.replace(' ', '_')}_gravity{use_gravity_alignment}_axes{show_axes}_refcam{reference_camera_idx}.glb",
     )
 
     # Load pitch angles from metadata if gravity alignment is enabled
@@ -320,6 +321,15 @@ def gradio_demo(
             print("No pitch angles found in metadata, will use camera orientation analysis")
             pitch_angles = None
 
+    # Convert reference_camera_idx from string to int or None
+    ref_cam_idx = None
+    if reference_camera_idx is not None and reference_camera_idx != "Average (All Cameras)":
+        try:
+            # Extract the index number from "Camera 0", "Camera 1", etc.
+            ref_cam_idx = int(reference_camera_idx.split()[-1])
+        except (ValueError, IndexError):
+            ref_cam_idx = None
+
     # Convert predictions to GLB
     try:
         glbscene = predictions_to_glb(
@@ -334,6 +344,7 @@ def gradio_demo(
             prediction_mode=prediction_mode,
             pitch_angles=pitch_angles,
             show_axes=show_axes,
+            reference_camera_idx=ref_cam_idx,
         )
         glbscene.export(file_obj=glbfile)
     except Exception as e:
@@ -348,8 +359,11 @@ def gradio_demo(
     end_time = time.time()
     print(f"Total time: {end_time - start_time:.2f} seconds (including IO)")
     log_msg = f"Reconstruction Success ({len(all_files)} frames). Waiting for visualization."
+    
+    # Build camera selection dropdown choices
+    camera_choices = ["Average (All Cameras)"] + [f"Camera {i}" for i in range(len(all_files))]
 
-    return glbfile, log_msg, gr.Dropdown(choices=frame_filter_choices, value=frame_filter, interactive=True)
+    return glbfile, log_msg, gr.Dropdown(choices=frame_filter_choices, value=frame_filter, interactive=True), gr.Dropdown(choices=camera_choices, value="Average (All Cameras)", interactive=True)
 
 
 # -------------------------------------------------------------------------
@@ -371,7 +385,7 @@ def update_log():
 
 def update_visualization(
     target_dir, conf_thres, frame_filter, mask_black_bg, mask_white_bg, show_cam, mask_sky, prediction_mode, 
-    use_gravity_alignment, show_axes, is_example
+    use_gravity_alignment, show_axes, reference_camera_idx, is_example
 ):
     """
     Reload saved predictions from npz, create (or reuse) the GLB for new parameters,
@@ -406,7 +420,7 @@ def update_visualization(
 
     glbfile = os.path.join(
         target_dir,
-        f"glbscene_{conf_thres}_{frame_filter.replace('.', '_').replace(':', '').replace(' ', '_')}_maskb{mask_black_bg}_maskw{mask_white_bg}_cam{show_cam}_sky{mask_sky}_pred{prediction_mode.replace(' ', '_')}_gravity{use_gravity_alignment}_axes{show_axes}.glb",
+        f"glbscene_{conf_thres}_{frame_filter.replace('.', '_').replace(':', '').replace(' ', '_')}_maskb{mask_black_bg}_maskw{mask_white_bg}_cam{show_cam}_sky{mask_sky}_pred{prediction_mode.replace(' ', '_')}_gravity{use_gravity_alignment}_axes{show_axes}_refcam{reference_camera_idx}.glb",
     )
 
     if not os.path.exists(glbfile):
@@ -422,6 +436,14 @@ def update_visualization(
             else:
                 pitch_angles = get_pitch_angles(image_names)
         
+        # Convert reference_camera_idx from string to int or None
+        ref_cam_idx = None
+        if reference_camera_idx is not None and reference_camera_idx != "Average (All Cameras)":
+            try:
+                ref_cam_idx = int(reference_camera_idx.split()[-1])
+            except (ValueError, IndexError):
+                ref_cam_idx = None
+        
         try:
             glbscene = predictions_to_glb(
                 predictions,
@@ -435,6 +457,7 @@ def update_visualization(
                 prediction_mode=prediction_mode,
                 pitch_angles=pitch_angles,
                 show_axes=show_axes,
+                reference_camera_idx=ref_cam_idx,
             )
             glbscene.export(file_obj=glbfile)
         except Exception as e:
@@ -596,6 +619,12 @@ with gr.Blocks(
                     mask_black_bg = gr.Checkbox(label="Filter Black Background", value=False)
                     mask_white_bg = gr.Checkbox(label="Filter White Background", value=False)
                     use_gravity_alignment = gr.Checkbox(label="Align with Gravity (from pitch metadata)", value=True)
+                    reference_camera_idx = gr.Dropdown(
+                        choices=["Average (All Cameras)"], 
+                        value="Average (All Cameras)", 
+                        label="Reference Camera for Gravity Alignment",
+                        interactive=True
+                    )
                     show_axes = gr.Checkbox(label="Show Coordinate Axes (X=Red, Y=Green, Z=Blue)", value=True)
 
     # ---------------------- Examples section (if examples are available) ----------------------
@@ -612,6 +641,7 @@ with gr.Blocks(
             prediction_mode,
             use_gravity_alignment,
             show_axes,
+            reference_camera_idx,
             is_example_str,
         ):
             """
@@ -623,17 +653,17 @@ with gr.Blocks(
             target_dir, image_paths = handle_uploads(input_video, input_images)
             # Always use "All" for frame_filter in examples
             frame_filter = "All"
-            glbfile, log_msg, dropdown = gradio_demo(
+            glbfile, log_msg, dropdown, camera_dropdown = gradio_demo(
                 target_dir, conf_thres, frame_filter, mask_black_bg, mask_white_bg, show_cam, mask_sky, prediction_mode,
-                use_gravity_alignment, show_axes
+                use_gravity_alignment, show_axes, reference_camera_idx
             )
-            return glbfile, log_msg, target_dir, dropdown, image_paths
+            return glbfile, log_msg, target_dir, dropdown, camera_dropdown, image_paths
 
         # Create examples list with available videos
         examples = []
         for i, video_path in enumerate(example_videos[:5]):  # Limit to 5 examples
             examples.append([
-                video_path, str(i+10), None, 50.0, False, False, True, False, "Depthmap and Camera Branch", True, True, "True"
+                video_path, str(i+10), None, 50.0, False, False, True, False, "Depthmap and Camera Branch", True, True, "Average (All Cameras)", "True"
             ])
 
         gr.Markdown("Click any row to load an example.", elem_classes=["example-log"])
@@ -652,9 +682,10 @@ with gr.Blocks(
                 prediction_mode,
                 use_gravity_alignment,
                 show_axes,
+                reference_camera_idx,
                 is_example,
             ],
-            outputs=[reconstruction_output, log_output, target_dir_output, frame_filter, image_gallery],
+            outputs=[reconstruction_output, log_output, target_dir_output, frame_filter, reference_camera_idx, image_gallery],
             fn=example_pipeline,
             cache_examples=False,
             examples_per_page=50,
@@ -682,8 +713,9 @@ with gr.Blocks(
             prediction_mode,
             use_gravity_alignment,
             show_axes,
+            reference_camera_idx,
         ],
-        outputs=[reconstruction_output, log_output, frame_filter],
+        outputs=[reconstruction_output, log_output, frame_filter, reference_camera_idx],
     ).then(
         fn=lambda: "False", inputs=[], outputs=[is_example]  # set is_example to "False"
     )
@@ -704,6 +736,7 @@ with gr.Blocks(
             prediction_mode,
             use_gravity_alignment,
             show_axes,
+            reference_camera_idx,
             is_example,
         ],
         [reconstruction_output, log_output],
@@ -721,6 +754,7 @@ with gr.Blocks(
             prediction_mode,
             use_gravity_alignment,
             show_axes,
+            reference_camera_idx,
             is_example,
         ],
         [reconstruction_output, log_output],
@@ -738,6 +772,7 @@ with gr.Blocks(
             prediction_mode,
             use_gravity_alignment,
             show_axes,
+            reference_camera_idx,
             is_example,
         ],
         [reconstruction_output, log_output],
@@ -755,6 +790,7 @@ with gr.Blocks(
             prediction_mode,
             use_gravity_alignment,
             show_axes,
+            reference_camera_idx,
             is_example,
         ],
         [reconstruction_output, log_output],
@@ -772,6 +808,7 @@ with gr.Blocks(
             prediction_mode,
             use_gravity_alignment,
             show_axes,
+            reference_camera_idx,
             is_example,
         ],
         [reconstruction_output, log_output],
@@ -789,6 +826,7 @@ with gr.Blocks(
             prediction_mode,
             use_gravity_alignment,
             show_axes,
+            reference_camera_idx,
             is_example,
         ],
         [reconstruction_output, log_output],
@@ -806,6 +844,7 @@ with gr.Blocks(
             prediction_mode,
             use_gravity_alignment,
             show_axes,
+            reference_camera_idx,
             is_example,
         ],
         [reconstruction_output, log_output],
@@ -823,6 +862,7 @@ with gr.Blocks(
             prediction_mode,
             use_gravity_alignment,
             show_axes,
+            reference_camera_idx,
             is_example,
         ],
         [reconstruction_output, log_output],
@@ -840,6 +880,25 @@ with gr.Blocks(
             prediction_mode,
             use_gravity_alignment,
             show_axes,
+            reference_camera_idx,
+            is_example,
+        ],
+        [reconstruction_output, log_output],
+    )
+    reference_camera_idx.change(
+        update_visualization,
+        [
+            target_dir_output,
+            conf_thres,
+            frame_filter,
+            mask_black_bg,
+            mask_white_bg,
+            show_cam,
+            mask_sky,
+            prediction_mode,
+            use_gravity_alignment,
+            show_axes,
+            reference_camera_idx,
             is_example,
         ],
         [reconstruction_output, log_output],
