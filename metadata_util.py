@@ -178,7 +178,7 @@ def compute_gravity_alignment_from_single_camera(
     
     Args:
         pitch_angles: List of pitch angles in degrees from EXIF/metadata
-                     (pitch relative to horizontal: -90° = horizontal, 0° = pointing down)
+                     (pitch: 0° = horizontal, negative = looking up, positive = looking down)
         extrinsics: Camera extrinsic matrices (N, 3, 4) or (N, 4, 4) from model
         camera_idx: Index of the camera to use as reference (0-based)
         
@@ -248,8 +248,9 @@ def compute_gravity_alignment_from_single_camera(
     up_world_from_pose = up_world_from_pose / up_norm
     
     # Calculate predicted pitch from the up vector
-    # pitch = -90° means camera horizontal (up vector perpendicular to gravity)
-    # pitch = 0° means camera vertical (up vector parallel to gravity)
+    # New convention: pitch = 0° means camera horizontal
+    #                pitch < 0 means looking upwards
+    #                pitch > 0 means looking downwards
     # The angle between up vector and world Z-axis tells us the pitch
     pred_pitch = 90.0 - np.degrees(np.arccos(np.clip(up_world_from_pose[2], -1.0, 1.0)))
     print(f"  Predicted pitch from camera up vector: {pred_pitch:.2f}°")
@@ -260,15 +261,15 @@ def compute_gravity_alignment_from_single_camera(
     print(f"  Adjusted EXIF pitch: {adjusted_pitch:.2f}°")
     
     # Build expected up vector from pitch angle
-    # pitch = -90° -> up vector horizontal (perpendicular to Z)
-    # pitch = 0° -> up vector vertical (parallel to Z)
-    pitch_angle_from_horizontal = adjusted_pitch + 90.0  # Convert to angle from horizontal
+    # pitch = 0° -> camera horizontal, up vector perpendicular to Z (horizontal)
+    # pitch = 90° -> camera pointing down, up vector parallel to Z (vertical up)
+    # pitch = -90° -> camera pointing up, up vector anti-parallel to Z (vertical down)
     
     # The up vector should have:
-    # - Z component based on pitch: sin(pitch_from_horizontal)
-    # - Horizontal component: cos(pitch_from_horizontal)
-    expected_z = np.sin(np.radians(pitch_angle_from_horizontal))
-    expected_horizontal_mag = np.cos(np.radians(pitch_angle_from_horizontal))
+    # - Z component based on pitch: sin(pitch)
+    # - Horizontal component: cos(pitch)
+    expected_z = np.sin(np.radians(adjusted_pitch))
+    expected_horizontal_mag = np.cos(np.radians(adjusted_pitch))
     
     # Keep horizontal direction from predicted up vector
     horizontal = up_world_from_pose.copy()
@@ -347,7 +348,7 @@ def compute_gravity_alignment_from_pitch_and_poses(
     
     Args:
         pitch_angles: List of pitch angles in degrees from EXIF/metadata
-                     (pitch relative to horizontal: -90° = horizontal, 0° = pointing down)
+                     (pitch: 0° = horizontal, negative = looking up, positive = looking down)
         extrinsics: Camera extrinsic matrices (N, 3, 4) or (N, 4, 4) from model
         reference_camera_idx: Optional index of camera to use as reference (0-based).
                             If None, uses average of all cameras.
@@ -406,8 +407,9 @@ def compute_gravity_alignment_from_pitch_and_poses(
         pred_up_vectors.append(up_world)
 
         # Calculate predicted pitch from the up vector
-        # pitch = -90° means camera horizontal (up vector perpendicular to Z)
-        # pitch = 0° means camera pointing down (up vector parallel to Z)
+        # New convention: pitch = 0° means camera horizontal
+        #                pitch < 0 means looking upwards  
+        #                pitch > 0 means looking downwards
         pred_pitch = 90.0 - np.degrees(np.arccos(np.clip(up_world[2], -1.0, 1.0)))
         predicted_pitches.append(pred_pitch)
 
@@ -419,16 +421,17 @@ def compute_gravity_alignment_from_pitch_and_poses(
         if pitch_value is None:
             pitch_value = avg_pitch
 
-        # Unwrap pitch value: sensor reports 0→-90 when tilting down, then -90→0 when tilting up.
-        # Adjust by ±180° to match predicted pitch direction.
+        # Unwrap pitch value to match predicted pitch direction
         candidates = [pitch_value, pitch_value - 180.0, pitch_value + 180.0]
         adjusted_pitch = min(candidates, key=lambda ang: abs(ang - pred_pitch))
         aligned_pitch_values.append(adjusted_pitch)
 
         # Convert pitch to up vector components
-        pitch_angle_from_horizontal = adjusted_pitch + 90.0
-        expected_z = np.sin(np.radians(pitch_angle_from_horizontal))
-        expected_horizontal_mag = np.cos(np.radians(pitch_angle_from_horizontal))
+        # pitch = 0° -> camera horizontal, up vector perpendicular to Z
+        # pitch = 90° -> camera pointing down, up vector parallel to Z  
+        # pitch = -90° -> camera pointing up, up vector anti-parallel to Z
+        expected_z = np.sin(np.radians(adjusted_pitch))
+        expected_horizontal_mag = np.cos(np.radians(adjusted_pitch))
 
         # Keep horizontal direction from predicted up vector
         horizontal = up_world.copy()
@@ -531,11 +534,10 @@ def compute_gravity_alignment_from_pitch(pitch_angles: List[Optional[float]]) ->
     DEPRECATED: Use compute_gravity_alignment_from_pitch_and_poses() instead
     for better accuracy when camera extrinsics are available.
     
-    In typical camera coordinate systems:
-    - Pitch angle describes rotation around the X-axis (side-to-side tilt)
-    - pitch = -90°: camera is horizontal (normal phone orientation)
-    - pitch = 0°: camera is vertical (pointing straight down or up)
-    - Negative pitch closer to 0 means camera pointing more downward
+    Pitch angle convention:
+    - pitch = 0°: camera is horizontal (pointing straight ahead)
+    - pitch < 0: camera looking upwards (tilted up)
+    - pitch > 0: camera looking downwards (tilted down)
     
     Args:
         pitch_angles: List of pitch angles in degrees (can contain None values)
@@ -555,9 +557,9 @@ def compute_gravity_alignment_from_pitch(pitch_angles: List[Optional[float]]) ->
     print(f"Average pitch angle: {avg_pitch:.2f} degrees ({len(valid_pitches)}/{len(pitch_angles)} images)")
     
     # Calculate rotation angle
-    # pitch = -90 (horizontal) → need 90° rotation
-    # pitch = 0 (vertical) → need 0° rotation
-    rotation_angle = -(avg_pitch + 90)
+    # pitch = 0 (horizontal) → need 0° rotation
+    # pitch = 90 (pointing down) → need -90° rotation
+    rotation_angle = -avg_pitch
     
     # Create rotation to compensate for pitch
     gravity_alignment = np.eye(4)
